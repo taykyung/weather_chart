@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>지역별 날씨 표</title>
+<style>
+:root{
+  --bg:#ffffff; --ink:#1f2328; --muted:#5f6b76; --grid:#b9c1c9; --head:#e3e8ec; --band:#f4f6f8;
+  --accent:#107c41; --warn:#b3261e; --surface:#ffffff;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){
+  :root{--bg:#14191e; --ink:#e7ecf0; --muted:#97a4af; --grid:#3a454f; --head:#26313a; --band:#1b232a;
+        --accent:#3fb97a; --warn:#ff8a80; --surface:#1b232a; color-scheme:dark;}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:"Pretendard","Noto Sans KR","Apple SD Gothic Neo","Malgun Gothic",system-ui,sans-serif;padding:16px;line-height:1.4}
+main{max-width:900px;margin:0 auto}
+.tools{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start;margin-bottom:12px}
+.search{position:relative;flex:1 1 240px}
+input{width:100%;padding:9px 12px;font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--grid);border-radius:4px}
+button{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--grid);border-radius:4px;padding:9px 14px;cursor:pointer}
+button:hover{border-color:var(--accent)}
+input:focus-visible,button:focus-visible,li:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.results{position:absolute;left:0;right:0;top:calc(100% + 2px);background:var(--surface);border:1px solid var(--grid);border-radius:4px;list-style:none;margin:0;padding:2px;z-index:5;box-shadow:0 6px 18px rgba(0,0,0,.2)}
+.results li{padding:8px 10px;cursor:pointer}
+.results li:hover,.results li:focus{background:var(--band)}
+.results small{color:var(--muted)}
+.results .none{cursor:default;color:var(--muted)}
+.status{font-size:.8rem;color:var(--muted);margin:0 0 6px}
+.scroll{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:520px;font-variant-numeric:tabular-nums}
+th,td{border:1px solid var(--grid);padding:9px 12px;text-align:center;vertical-align:middle;white-space:nowrap}
+thead th{background:var(--head);font-weight:700}
+td.city{font-weight:700;background:var(--surface)}
+tbody tr:nth-child(even) td:not(.city){background:var(--band)}
+.x{background:transparent;border:none;color:var(--muted);padding:0 0 0 8px;font-size:1rem;line-height:1}
+.x:hover{color:var(--warn)}
+.empty{color:var(--muted);padding:24px}
+.note{font-size:.78rem;color:var(--muted);margin-top:8px}
+</style>
+</head>
+<body>
+<main>
+  <div class="tools">
+    <div class="search">
+      <input id="q" type="search" placeholder="지역 추가 (예: 서울, Tokyo, Paris)" autocomplete="off" aria-label="지역 검색">
+      <ul class="results" id="results" hidden></ul>
+    </div>
+    <button id="unit" type="button" aria-label="온도 단위 전환">°C</button>
+    <button id="refresh" type="button">새로고침</button>
+  </div>
+  <p class="status" id="status" aria-live="polite"></p>
+
+  <div class="scroll">
+    <table id="tbl">
+      <thead>
+        <tr><th>지역</th><th>체감온도<br>(오전 / 오후)</th><th>바람<br>(오전 / 오후)</th><th>강수량<br>(오전 / 오후)</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="note">오전은 8시, 오후는 6시 예보이고 각 지역의 현지 시각 기준이에요. 값은 오전 / 오후 순서예요. 강수량은 해당 1시간 동안의 예상량이에요.</p>
+</main>
+
+<script>
+const DEFAULT_CITIES = [
+  { id: 1835848, name: "서울", lat: 37.566, lon: 126.978 },
+  { id: 1838524, name: "부산", lat: 35.102, lon: 129.040 },
+  { id: 1850147, name: "도쿄", lat: 35.689, lon: 139.692 },
+  { id: 5128581, name: "뉴욕", lat: 40.714, lon: -74.006 }
+];
+const $ = id => document.getElementById(id);
+function load(k, f){ try{ const v = localStorage.getItem("wt:"+k); return v ? JSON.parse(v) : f; }catch(e){ return f; } }
+function save(k, v){ try{ localStorage.setItem("wt:"+k, JSON.stringify(v)); }catch(e){} }
+
+let cities = load("cities", DEFAULT_CITIES);
+let unit = load("unit", "C");
+const cache = {};
+
+const fmt = c => Math.round(unit==="C" ? c : c*9/5+32) + "°";
+const windFmt = k => unit==="C" ? Math.round(k)+" km/h" : Math.round(k*0.621)+" mph";
+
+async function fetchWeather(c){
+  const url = "https://api.open-meteo.com/v1/forecast?latitude="+c.lat+"&longitude="+c.lon
+    + "&hourly=temperature_2m,apparent_temperature,wind_speed_10m,precipitation&forecast_days=1&timezone=auto";
+  const res = await fetch(url);
+  if(!res.ok) throw new Error("HTTP "+res.status);
+  const h = (await res.json()).hourly;
+  const at = i => ({ t:h.temperature_2m[i], f:h.apparent_temperature[i], w:h.wind_speed_10m[i], r:h.precipitation[i] });
+  return { h8: at(8), h18: at(18) };
+}
+
+async function refreshAll(){
+  $("status").textContent = "불러오는 중…";
+  await Promise.all(cities.map(async c => {
+    try{ cache[c.id] = await fetchWeather(c); }
+    catch(e){ if(!cache[c.id] || cache[c.id].error) cache[c.id] = { error:true }; }
+  }));
+  render();
+  $("status").textContent = "마지막 갱신 " + new Date().toLocaleTimeString("ko-KR",{hour:"2-digit",minute:"2-digit"});
+}
+
+function td(text, cls){
+  const el = document.createElement("td");
+  if(cls) el.className = cls;
+  el.textContent = text;
+  return el;
+}
+
+function render(){
+  const body = $("tbl").tBodies[0];
+  body.textContent = "";
+  if(!cities.length){
+    const tr = document.createElement("tr");
+    const c = td("위 검색창에서 지역을 추가해 주세요.", "empty");
+    c.colSpan = 4; tr.append(c); body.append(tr);
+    return;
+  }
+  cities.forEach(c => {
+    const w = cache[c.id];
+    const tr = document.createElement("tr");
+    const cell = td(c.name, "city");
+    const x = document.createElement("button");
+    x.className = "x"; x.type = "button"; x.textContent = "×";
+    x.setAttribute("aria-label", c.name + " 삭제");
+    x.onclick = () => { cities = cities.filter(k => k.id !== c.id); save("cities", cities); render(); };
+    cell.append(x);
+    tr.append(cell);
+    if(!w){ tr.append(td("…"), td("…"), td("…")); }
+    else if(w.error){ tr.append(td("불러오기 실패"), td("–"), td("–")); }
+    else {
+      const am = w.h8, pm = w.h18;
+      tr.append(
+        td(fmt(am.f) + " / " + fmt(pm.f)),
+        td(windFmt(am.w) + " / " + windFmt(pm.w)),
+        td(am.r.toFixed(1) + " / " + pm.r.toFixed(1) + " mm")
+      );
+    }
+    body.append(tr);
+  });
+}
+
+let timer;
+$("q").addEventListener("input", e => {
+  clearTimeout(timer);
+  const v = e.target.value.trim();
+  if(!v){ $("results").hidden = true; return; }
+  timer = setTimeout(() => search(v), 300);
+});
+document.addEventListener("click", e => { if(!e.target.closest(".search")) $("results").hidden = true; });
+
+async function search(v){
+  const box = $("results");
+  box.textContent = "";
+  const msg = t => { const li = document.createElement("li"); li.className = "none"; li.textContent = t; box.append(li); };
+  try{
+    const res = await fetch("https://geocoding-api.open-meteo.com/v1/search?count=6&language=ko&name=" + encodeURIComponent(v));
+    const d = await res.json();
+    if(!d.results || !d.results.length) msg("검색 결과가 없어요. 다른 표기로 입력해 보세요.");
+    else d.results.forEach(r => {
+      const li = document.createElement("li"); li.tabIndex = 0;
+      li.textContent = r.name + " ";
+      const s = document.createElement("small");
+      s.textContent = [r.admin1, r.country].filter(Boolean).join(", ");
+      li.append(s);
+      li.onclick = () => addCity(r);
+      li.onkeydown = ev => { if(ev.key === "Enter") addCity(r); };
+      box.append(li);
+    });
+  }catch(e){ msg("검색에 실패했어요. 인터넷 연결을 확인해 주세요."); }
+  box.hidden = false;
+}
+
+async function addCity(r){
+  $("results").hidden = true; $("q").value = "";
+  if(cities.some(c => c.id === r.id)) return;
+  const c = { id:r.id, name:r.name, lat:r.latitude, lon:r.longitude };
+  cities.push(c); save("cities", cities); render();
+  try{ cache[c.id] = await fetchWeather(c); }catch(e){ cache[c.id] = { error:true }; }
+  render();
+}
+
+$("unit").textContent = "°" + unit;
+$("unit").onclick = () => { unit = unit==="C" ? "F" : "C"; save("unit", unit); $("unit").textContent = "°" + unit; render(); };
+$("refresh").onclick = refreshAll;
+
+render();
+refreshAll();
+setInterval(refreshAll, 10 * 60 * 1000);
+</script>
+</body>
+</html>
